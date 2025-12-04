@@ -34,6 +34,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     intel-oneapi-mkl-devel=2024.0.0-49656 \
     build-essential \
+    libomp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN echo "int mkl_serv_intel_cpu_true() {return 1;}" > fakeintel.c && \
@@ -71,7 +72,12 @@ RUN --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
     --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
     cargo build --release --bin text-embeddings-router --features ort,candle,mkl,static-linking,grpc --no-default-features && sccache -s
 
-FROM debian:bookworm-slim AS base
+# Helper stage to locate libiomp5.so in builder
+# Check MKL installation and common Intel oneAPI paths
+FROM builder AS libiomp5-finder
+RUN find /opt/intel/oneapi -name "libiomp5.so" -type f 2>/dev/null | head -1 | xargs -I {} sh -c 'if [ -n "{}" ]; then cp {} /libiomp5.so; else touch /libiomp5.so; fi' || touch /libiomp5.so
+
+FROM 090802221799.dkr.ecr.us-west-2.amazonaws.com/chainguard/wolfi:latest-20251204-130502 AS base
 
 ENV HUGGINGFACE_HUB_CACHE=/data \
     PORT=80 \
@@ -80,12 +86,37 @@ ENV HUGGINGFACE_HUB_CACHE=/data \
     LD_PRELOAD=/usr/local/libfakeintel.so \
     LD_LIBRARY_PATH=/usr/local/lib
 
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    libomp-dev \
-    ca-certificates \
-    libssl-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk update && apk add --no-cache ca-certificates-bundle openssl curl bash bzip2
+
+# Install libstdc++ (latest version, provides required C++ ABI versions)
+RUN apk add --no-cache libstdc++
+
+# Copy Intel OpenMP (libiomp5.so)
+# Try to get it from the finder stage first, fallback to download
+COPY --from=libiomp5-finder /libiomp5.so /tmp/libiomp5.so
+RUN if [ -f /tmp/libiomp5.so ] && [ -s /tmp/libiomp5.so ]; then \
+        cp /tmp/libiomp5.so /usr/lib/libiomp5.so && \
+        rm /tmp/libiomp5.so; \
+    else \
+        echo "libiomp5.so not found in builder, downloading..." && \
+        (curl -Lf https://anaconda.org/conda-forge/libiomp/2023.2.0/download/linux-64/libiomp-2023.2.0-h84fe0f5_0.tar.bz2 -o /tmp/libiomp.tar.bz2 && \
+         tar -xjf /tmp/libiomp.tar.bz2 -C /tmp 2>/dev/null && \
+         find /tmp -name "libiomp5.so" -type f -exec cp {} /usr/lib/libiomp5.so \; && \
+         rm -rf /tmp/libiomp* || \
+         curl -Lf https://github.com/intel/intel-extension-for-pytorch/releases/download/v2.1.10+gitd5e0c5a/libiomp5.so -o /usr/lib/libiomp5.so || \
+         (echo "ERROR: Could not obtain libiomp5.so from any source" && exit 1)); \
+    fi && \
+    chmod 755 /usr/lib/libiomp5.so
+
+# Copy OpenMP library from builder stage
+# Copy the actual library file (not symlinks) and create necessary symlinks
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libomp.so* /usr/local/lib/
+# Ensure libomp.so symlink exists
+RUN if [ -f /usr/local/lib/libomp.so.5 ] && [ ! -f /usr/local/lib/libomp.so ]; then \
+        ln -s libomp.so.5 /usr/local/lib/libomp.so; \
+    fi && \
+    # Update library cache so dynamic linker can find the libraries
+    ldconfig
 
 # Copy a lot of the Intel shared objects because of the mkl_serv_intel_cpu_true patch...
 COPY --from=builder /opt/intel/oneapi/mkl/latest/lib/intel64/libmkl_intel_lp64.so.2 /usr/local/lib/libmkl_intel_lp64.so.2
