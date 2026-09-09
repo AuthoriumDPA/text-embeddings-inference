@@ -77,7 +77,7 @@ RUN --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
 FROM builder AS libiomp5-finder
 RUN find /opt/intel/oneapi -name "libiomp5.so" -type f 2>/dev/null | head -1 | xargs -I {} sh -c 'if [ -n "{}" ]; then cp {} /libiomp5.so; else touch /libiomp5.so; fi' || touch /libiomp5.so
 
-FROM 090802221799.dkr.ecr.us-west-2.amazonaws.com/chainguard/wolfi:latest-20260611-175914 AS base
+FROM 090802221799.dkr.ecr.us-west-2.amazonaws.com/chainguard/wolfi:latest-20260909-142727 AS base
 
 ENV HUGGINGFACE_HUB_CACHE=/data \
     PORT=80 \
